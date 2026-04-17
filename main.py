@@ -53,42 +53,42 @@ class BanditDataset(Dataset):
         
         return self.x[idx], self.z[idx], self.c[idx]
     
-class NuisanceDataset(Dataset):
-    """Dataset once nuisances have been computed."""
+# class NuisanceDataset(Dataset):
+#     """Dataset once nuisances have been computed."""
     
-    def __init__(self, x, y, paths, seed=None):
-        """
-        Args:
-            x: input features (num_samples, num_features)
-            c: cost vectors (num_samples, num_edges)
-            paths: array of valid paths (num_paths, num_edges)
-            seed: random seed for reproducibility
-        """
-        self.x = torch.FloatTensor(x)
-        self.y = torch.FloatTensor(y)
-        self.paths = torch.FloatTensor(paths)
-        zs = np.empty((0, len(paths[0])))
-        cs = np.empty((0, 1))
+#     def __init__(self, x, y, paths, seed=None):
+#         """
+#         Args:
+#             x: input features (num_samples, num_features)
+#             c: cost vectors (num_samples, num_edges)
+#             paths: array of valid paths (num_paths, num_edges)
+#             seed: random seed for reproducibility
+#         """
+#         self.x = torch.FloatTensor(x)
+#         self.y = torch.FloatTensor(y)
+#         self.paths = torch.FloatTensor(paths)
+#         zs = np.empty((0, len(paths[0])))
+#         cs = np.empty((0, 1))
 
-        for idx in range(len(self.x)):
-            path_idx = np.random.choice(len(self.paths))
-            z = self.paths[path_idx]
-            c = torch.dot(self.y[idx], z)
-            zs = np.vstack([zs, z])
-            cs = np.vstack([cs, c])
+#         for idx in range(len(self.x)):
+#             path_idx = np.random.choice(len(self.paths))
+#             z = self.paths[path_idx]
+#             c = torch.dot(self.y[idx], z)
+#             zs = np.vstack([zs, z])
+#             cs = np.vstack([cs, c])
 
-        self.z = torch.FloatTensor(zs)
-        self.c = torch.FloatTensor(cs)
+#         self.z = torch.FloatTensor(zs)
+#         self.c = torch.FloatTensor(cs)
         
-        if seed is not None:
-            np.random.seed(seed)
+#         if seed is not None:
+#             np.random.seed(seed)
         
-    def __len__(self):
-        return len(self.x)
+#     def __len__(self):
+#         return len(self.x)
     
-    def __getitem__(self, idx):
+#     def __getitem__(self, idx):
         
-        return self.x[idx], self.z[idx], self.c[idx]
+#         return self.x[idx], self.z[idx], self.c[idx]
 
 class NuisanceRegression(nn.Module):
 
