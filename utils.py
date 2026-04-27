@@ -17,6 +17,8 @@ from sklearn.linear_model import LogisticRegression
 from torch.utils.data import Dataset
 from longestpath import longestPathModel
 
+"""TODO: Utils and experiments currently hard coded to be compatible with 5x5 grid with 40 arcs and 70 edges - fix magic number references when switching to real world data"""
+
 class BanditDataset(Dataset):
     """Dataset that randomly selects paths from a pool of valid paths."""
     
@@ -24,9 +26,10 @@ class BanditDataset(Dataset):
         """
         Args:
             x: input features (num_samples, num_features)
-            c: cost vectors (num_samples, num_edges)
+            y: cost vectors (num_samples, num_edges)
             paths: array of valid paths (num_paths, num_edges)
             seed: random seed for reproducibility
+            noise: perturbation to apply to observed costs (useful for importing misaligned data)
         """
         if seed is not None:
             np.random.seed(seed)
@@ -40,14 +43,14 @@ class BanditDataset(Dataset):
 
 
         for idx in range(len(self.x)):
-            if rationality is not None:
+            if rationality is not None: # Select path that aligns with rationality
                 costs = [torch.dot(self.y[idx], path) for path in self.allpaths]
                 worst_cost = max(costs)
                 opt_cost = min(costs)
                 target = (1-rationality) * (worst_cost - opt_cost) + opt_cost
                 diffs = [abs(cost - target) for cost in costs]
                 path_idx = np.argmin(diffs)
-            else:
+            else: # Select random path
                 path_idx = np.random.choice(len(self.allpaths))
             z = self.allpaths[path_idx]
             c = torch.dot(self.y[idx], z) + np.random.uniform(low=-noise, high=noise)
@@ -85,8 +88,10 @@ class ValImputeDataset(Dataset):
         """
         Args:
             x: input features (num_samples, num_features)
-            c: cost vectors (num_samples, num_edges)
-            paths: array of valid paths (num_paths, num_edges)
+            y: cost vectors (num_samples, num_edges)
+            arcs: array of arcs to impute on
+            val: value to impute
+            copies: amount of data to impute (may be irrelevant?)
             seed: random seed for reproducibility
         """
         if seed is not None:
@@ -130,6 +135,7 @@ class ValImputeDataset(Dataset):
         self.y = torch.concat([self.y, imputeset.y])
 
 class NuisanceRegression(nn.Module):
+    # NN Module for learning nuisance function according to regularized least squares
 
     def __init__(self, num_features=3, num_edges=40, lam = 0):
         super(NuisanceRegression, self).__init__()
@@ -148,6 +154,7 @@ class NuisanceRegression(nn.Module):
         return loss
     
 class LinearRegression(nn.Module):
+    # NN Module for decision focused learning of costs
 
     def __init__(self):
         super(LinearRegression, self).__init__()
@@ -157,7 +164,8 @@ class LinearRegression(nn.Module):
         out = self.linear(x)
         return out
     
-def thetadr(x, z, c, nuisance_model, Sigma, reg=True):
+def thetadr(x, z, c, nuisance_model, Sigma, reg=True): 
+    # Approximates Y according to Hu et al.
     if reg == True:
         return nuisance_model.linear(torch.FloatTensor(x)) + torch.linalg.inv(Sigma + torch.eye(40)) @ z * (c - torch.dot(z, nuisance_model.linear(torch.FloatTensor(x))))
     else:
@@ -180,6 +188,7 @@ def get_path(verts):
     return z
 
 def get_paths(unexplorable = []):
+    # Returns all paths that do not contain the unexplorable arcs
     exploredpaths = np.empty((0, 40))
     unexploredpaths = np.empty((0, 40))
     for comb in combinations(range(8), 4):
@@ -193,7 +202,8 @@ def get_paths(unexplorable = []):
 def get_unexplored(dataset):
     return (sum(dataset.z) == 0).nonzero(as_tuple=True)[0]
 
-def f(x, theta):
+def f(x, theta): 
+    # Underlying data generation method
     return theta[0] + x[0]*theta[1] + x[1]*theta[2] + x[2]*theta[3]
 
 def getdata(n, a, w):
@@ -280,7 +290,7 @@ def learn_gram(dataset, use_propensities=True):
 
 def learn_dfl(dataset, testset, num_epochs, sigma, allregrets=False):
     optmodel = shortestPathModel(grid=(5,5))
-    pg = pyepo.func.perturbationGradient(optmodel, sigma, two_sides=True, processes=2)
+    pg = pyepo.func.perturbationGradient(optmodel, sigma, two_sides=True, processes=2) # decision focused loss term
     trainloader = DataLoader(dataset, batch_size=32, shuffle=True)
     testloader = DataLoader(testset, batch_size=32, shuffle=True)
     predmodel = LinearRegression()

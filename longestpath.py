@@ -19,7 +19,7 @@ from pyepo.model.opt import _get_grid_arcs
 
 class longestPathModel(optGrbModel):
     """
-    This class is an optimization model for the shortest path problem
+    This class is a (POOR) optimization model for the shortest path problem
 
     Attributes:
         _model (GurobiPy model): Gurobi model
@@ -44,7 +44,7 @@ class longestPathModel(optGrbModel):
             tuple: optimization model and variables
         """
         # create a model
-        m = gp.Model("shortest path")
+        m = gp.Model("longest path")
         # variables
         x = m.addVars(self.arcs, name="x")
         # sense
