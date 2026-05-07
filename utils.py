@@ -1,28 +1,26 @@
 import pandas as pd
 import numpy as np
-import math
-import random
 from itertools import combinations
-import scipy
 from scipy.optimize import curve_fit
 import pyepo
 from pyepo.model.grb import shortestPathModel
-import gurobipy
 from torch.utils.data import DataLoader
 from torch import nn
 import torch
-from tqdm.notebook import tqdm
-import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
 from sklearn.linear_model import LogisticRegression
 from torch.utils.data import Dataset
 from longestpath import longestPathModel
 
 """TODO: Utils and experiments currently hard coded to be compatible with 5x5 grid with 40 arcs and 70 edges - fix magic number references when switching to real world data"""
 
+SYNTHETIC_FEATS = 3
+SYNTHETIC_PATHS = 40
+
 class BanditDataset(Dataset):
     """Dataset that randomly selects paths from a pool of valid paths."""
     
-    def __init__(self, x, y, paths, rationality = None, seed=None, noise=0):
+    def __init__(self, x, y, paths, rationality = None, seed=None, noise=0, numarcs=SYNTHETIC_PATHS):
         """
         Args:
             x: input features (num_samples, num_features)
@@ -38,7 +36,7 @@ class BanditDataset(Dataset):
         self.x = torch.FloatTensor(x)
         self.y = torch.FloatTensor(y)
         self.allpaths = torch.FloatTensor(paths)
-        zs = np.empty((0, 40))
+        zs = np.empty((0, numarcs))
         cs = np.empty((0, 1))
 
 
@@ -78,13 +76,54 @@ class BanditDataset(Dataset):
     def get_unexplored(self):
         set_a = set(map(tuple, self.allpaths.detach().numpy()))
         set_b = set(map(tuple, self.paths))
-        return np.array(list(set_a - set_b))
+        return np.array(list(set_a - set_b), dtype=int)
 
+class GammaImputeDataset(Dataset):
+    """Dataset that randomly selects paths from a pool of valid paths.
+    Perturbs observed costs towards mean of distribution according to gamma [-1, 1]"""
     
+    def __init__(self, x, y, paths, mean, gamma = 1, copies = 1, seed=None, noise=0, numfeats=SYNTHETIC_FEATS, numpaths=SYNTHETIC_PATHS):
+        """
+        Args:
+            x: input features (num_samples, num_features)
+            y: cost vectors (num_samples, num_edges)
+            paths: array of valid paths (num_paths, num_edges)
+            seed: random seed for reproducibility
+            noise: perturbation to apply to observed costs (useful for importing misaligned data)
+        """
+        if seed is not None:
+            np.random.seed(seed)
+
+
+        xs = np.empty((0, numfeats))
+        ys = np.empty((0, numpaths))
+        self.allpaths = torch.FloatTensor(paths)
+        zs = np.empty((0, numpaths))
+        cs = np.empty((0, 1))
+
+
+        for i in range(copies):
+            for idx in range(len(x)):
+                path_idx = np.random.choice(len(self.allpaths))
+                z = self.allpaths[path_idx]
+                observedy = mean + gamma * (y[idx] - mean)
+                c = np.dot(observedy, z) + np.random.uniform(low=-noise, high=noise)
+                zs = np.vstack([zs, z])
+                # observed_c = mean + gamma * (c - mean)
+                cs = np.vstack([cs, c])
+                xs = np.vstack([xs, x[idx]])
+                ys = np.vstack([ys, observedy])
+
+        self.x = torch.FloatTensor(xs)
+        self.y = torch.FloatTensor(ys)
+        self.z = torch.FloatTensor(zs)
+        self.c = torch.FloatTensor(cs)
+        self.paths = np.unique(self.z.detach().numpy(), axis=0)    
+
 class ValImputeDataset(Dataset):
     """Impute a specific value for the given paths"""
     
-    def __init__(self, x, y, arcs, val = 0, copies = 1, seed=None):
+    def __init__(self, x, y, arcs, val = 0, copies = 1, seed=None, numfeats=SYNTHETIC_FEATS, numpaths=SYNTHETIC_PATHS):
         """
         Args:
             x: input features (num_samples, num_features)
@@ -97,16 +136,16 @@ class ValImputeDataset(Dataset):
         if seed is not None:
             np.random.seed(seed)
 
-        xs = np.empty((0, 3))
-        ys = np.empty((0, 40))
-        zs = np.empty((0, 40))
+        xs = np.empty((0, numfeats))
+        ys = np.empty((0, numpaths))
+        zs = np.empty((0, numpaths))
         cs = np.empty((0, 1))
 
         for i in range(copies):
             for arc in arcs:
                 idx = np.random.choice(len(x))
 
-                path = np.zeros(40)
+                path = np.zeros(numpaths)
                 path[arc] = 1
                 z = path
                 c = val
@@ -137,7 +176,7 @@ class ValImputeDataset(Dataset):
 class NuisanceRegression(nn.Module):
     # NN Module for learning nuisance function according to regularized least squares
 
-    def __init__(self, num_features=3, num_edges=40, lam = 0):
+    def __init__(self, num_features=SYNTHETIC_FEATS, num_edges=SYNTHETIC_PATHS, lam = 0):
         super(NuisanceRegression, self).__init__()
         self.linear = nn.Linear(num_features, num_edges)
         self.lam = lam
@@ -156,9 +195,9 @@ class NuisanceRegression(nn.Module):
 class LinearRegression(nn.Module):
     # NN Module for decision focused learning of costs
 
-    def __init__(self):
+    def __init__(self, num_features=SYNTHETIC_FEATS, num_edges=SYNTHETIC_PATHS):
         super(LinearRegression, self).__init__()
-        self.linear = nn.Linear(3, 40)
+        self.linear = nn.Linear(num_features, num_edges)
 
     def forward(self, x):
         out = self.linear(x)
@@ -169,7 +208,7 @@ def thetadr(x, z, c, nuisance_model, Sigma, reg=True):
     if reg == True:
         return nuisance_model.linear(torch.FloatTensor(x)) + torch.linalg.inv(Sigma + torch.eye(40)) @ z * (c - torch.dot(z, nuisance_model.linear(torch.FloatTensor(x))))
     else:
-        return nuisance_model.linear(torch.FloatTensor(x)) + torch.linalg.inv(Sigma) @ z * (c - torch.dot(z, nuisance_model.linear(torch.FloatTensor(x))))
+        return nuisance_model.linear(torch.FloatTensor(x)) + torch.linalg.pinv(Sigma) @ z * (c - torch.dot(z, nuisance_model.linear(torch.FloatTensor(x))))
     
 
 def get_path(verts):
@@ -189,8 +228,8 @@ def get_path(verts):
 
 def get_paths(unexplorable = []):
     # Returns all paths that do not contain the unexplorable arcs
-    exploredpaths = np.empty((0, 40))
-    unexploredpaths = np.empty((0, 40))
+    exploredpaths = np.empty((0, SYNTHETIC_PATHS))
+    unexploredpaths = np.empty((0, SYNTHETIC_PATHS))
     for comb in combinations(range(8), 4):
         path = get_path(comb)
         if np.any([path[i] == 1 for i in unexplorable]):
@@ -200,7 +239,16 @@ def get_paths(unexplorable = []):
     return exploredpaths, unexploredpaths
 
 def get_unexplored(dataset):
-    return (sum(dataset.z) == 0).nonzero(as_tuple=True)[0]
+    return (sum(dataset.paths) == 0).nonzero()[0]
+
+def get_unexplored_paths(dataset, allpaths):
+    a = allpaths
+    b = dataset.paths
+    a_view = a.view([('', a.dtype)] * a.shape[1]).ravel()
+    b_view = b.view([('', b.dtype)] * b.shape[1]).ravel()
+
+    missing_rows = a[~np.isin(a_view, b_view)]
+    return missing_rows
 
 def f(x, theta): 
     # Underlying data generation method
@@ -209,7 +257,7 @@ def f(x, theta):
 def getdata(n, a, w):
     theta = np.vstack([a, w])
     noise = np.random.uniform(low=-0.5, high=0.5, size = (n, 1))
-    X = np.random.normal(size = (n, 3))
+    X = np.random.normal(size = (n, SYNTHETIC_FEATS))
     Y = np.empty((n, len(a)))
     for i in range(n):
         Y[i] = f(X[i], theta) + noise[i]
@@ -225,9 +273,9 @@ def get_rationality(dataset):
     high = sum(tempset.objs/len(dataset.c))
     return (high - mycost)/(high - low)
 
-def learn_nuisance(dataset, num_epochs, lam=0):
+def learn_nuisance(dataset, num_epochs, lam=0, num_features=SYNTHETIC_FEATS, num_edges=SYNTHETIC_PATHS):
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
-    nuisance_model = NuisanceRegression(num_features=3, num_edges=40, lam=lam)
+    nuisance_model = NuisanceRegression(num_features=num_features, num_edges=num_edges, lam=lam)
     optimizer = torch.optim.Adam(nuisance_model.parameters(), lr=1e-3)
     print("\nLearning fnuisance function...", flush=True)
     for epoch in tqdm(range(num_epochs)):
@@ -244,56 +292,67 @@ def learn_nuisance(dataset, num_epochs, lam=0):
 
     return nuisance_model
 
-def learn_propensities(dataset):
-    # Fit a model to predict the path index from x
+def learn_propensities(dataset, indices):
     path_indices = []
-    for i in range(len(dataset)):
-        z = dataset.z[i]
-        # Find index in dataset.paths
+
+    for idx in indices:
+        z = dataset.z[idx]
         diffs = [torch.sum((z - path)**2) for path in dataset.paths]
-        idx = torch.argmin(torch.tensor(diffs))
-        path_indices.append(idx.item())
-    
-    # Fit multinomial logistic regression
+        path_indices.append(torch.argmin(torch.tensor(diffs)).item())
+
     clf = LogisticRegression(multi_class='multinomial', max_iter=1000, solver='lbfgs')
-    clf.fit(dataset.x.numpy(), path_indices)
-    
-    # Predict probabilities
-    probs = clf.predict_proba(dataset.x.numpy())
-    
-    # Map original path indices to column indices in probs
-    # clf.classes_ contains the unique class labels seen during training
+
+    X = dataset.x[indices].numpy()
+    clf.fit(X, path_indices)
+
+    probs = clf.predict_proba(X)
+
     class_to_col = {cls: col for col, cls in enumerate(clf.classes_)}
-    
-    # e_hat[i] = P(Z = z_i | x_i)
-    e_hats = [probs[i, class_to_col[path_indices[i]]] for i in range(len(dataset))]
+    e_hats = [probs[i, class_to_col[path_indices[i]]] for i in range(len(indices))]
+
     return e_hats
 
-def learn_gram(dataset, use_propensities=True):
+def learn_gram(dataset, use_propensities=True, num_edges=SYNTHETIC_PATHS):
+    # --- NEW: resolve base dataset + indices ---
+    if hasattr(dataset, "indices"):  # it's a Subset
+        base_dataset = dataset.dataset
+        indices = dataset.indices
+    else:
+        base_dataset = dataset
+        indices = range(len(dataset))
+    # ------------------------------------------
     if use_propensities:
-        e_hats = learn_propensities(dataset)
-        Gram = torch.zeros(size=(40, 40))
+        e_hats = learn_propensities(base_dataset, indices)
+
+        Gram = torch.zeros(size=(num_edges, num_edges))
         weights = []
-        for i in range(len(dataset.x)):
+
+        for i, idx in enumerate(indices):
             if e_hats[i] > 0:
                 weight = 1.0 / e_hats[i]
-                Gram += weight * dataset.z[i].reshape(40, 1) @ dataset.z[i].reshape(1, 40)
+                z = base_dataset.z[idx]
+                Gram += weight * z.reshape(num_edges, 1) @ z.reshape(1, num_edges)
                 weights.append(weight)
+
         if weights:
             Gram /= sum(weights)
+
     else:
-        Gram = torch.zeros(size=(40, 40))
-        for i in range(len(dataset.x)):
-            Gram += dataset.z[i].reshape(40, 1) @ dataset.z[i].reshape(1, 40)
-        Gram /= len(dataset.x)
+        Gram = torch.zeros(size=(num_edges, num_edges))
+        for idx in indices:
+            z = base_dataset.z[idx]
+            Gram += z.reshape(num_edges, 1) @ z.reshape(1, num_edges)
+
+        Gram /= len(indices)
+
     return Gram
 
-def learn_dfl(dataset, testset, num_epochs, sigma, allregrets=False):
-    optmodel = shortestPathModel(grid=(5,5))
+def learn_dfl(dataset, testset, num_epochs, sigma, allregrets=False, optmodel=None, num_features=SYNTHETIC_FEATS, num_edges=SYNTHETIC_PATHS):
+    optmodel = optmodel if optmodel is not None else shortestPathModel(grid=(5,5))
     pg = pyepo.func.perturbationGradient(optmodel, sigma, two_sides=True, processes=2) # decision focused loss term
     trainloader = DataLoader(dataset, batch_size=32, shuffle=True)
     testloader = DataLoader(testset, batch_size=32, shuffle=True)
-    predmodel = LinearRegression()
+    predmodel = LinearRegression(num_features, num_edges)
     optimizer = torch.optim.Adam(predmodel.parameters(), lr=1e-3)
     trainregrets=[]
     testregrets=[]
@@ -321,3 +380,5 @@ def learn_dfl(dataset, testset, num_epochs, sigma, allregrets=False):
         return predmodel, trainregrets, testregrets
     else:
         return predmodel, trainregret, testregret
+
+
